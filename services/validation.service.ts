@@ -1,4 +1,8 @@
 import { prisma } from '../lib/prisma';
+import { PrismaClient, AuditAction } from '@prisma/client';
+
+// Extract the transaction client type from PrismaClient
+type TxClient = Parameters<Parameters<PrismaClient['$transaction']>[0]>[0];
 
 // ---------------------------------------------------------------------------
 // Guard: Is the student already ENROLLED in this course?
@@ -40,7 +44,9 @@ export const checkAlreadyWaitlisted = async (userId: string, courseId: string) =
 // Credit Limit Check
 // ---------------------------------------------------------------------------
 export const checkCreditLimit = async (userId: string, newCourseId: string) => {
-  const MAX_CREDITS = 24;
+  // Dynamic credit limit from SystemSettings (fallback to 18)
+  const settings = await prisma.systemSettings.findUnique({ where: { id: 'default' } });
+  const MAX_CREDITS = settings?.maxSemesterCredits ?? 18;
 
   // Fetch the user's ENROLLED registrations (waitlisted don't consume credits)
   const [user, newCourse] = await Promise.all([
@@ -170,4 +176,98 @@ export const checkTimeClash = async (userId: string, newCourseId: string) => {
   }
 
   return { success: true };
+};
+
+// ---------------------------------------------------------------------------
+// Shared Drop + Waitlist Promotion Logic (FOR UPDATE transactional)
+// ---------------------------------------------------------------------------
+export const executeDropWithPromotion = async (
+  tx: TxClient,
+  userId: string,
+  courseId: string,
+  auditAction: AuditAction
+) => {
+  // 1. Verify the student is currently ENROLLED
+  const existingReg = await tx.registration.findUnique({
+    where: { userId_courseId: { userId, courseId } }
+  });
+
+  if (!existingReg || existingReg.status !== 'ENROLLED') {
+    throw new Error('Student is not currently enrolled in this course.');
+  }
+
+  // 2. Lock the course row with FOR UPDATE
+  const courses: any[] = await tx.$queryRaw`
+    SELECT * FROM "Course" WHERE id = ${courseId} FOR UPDATE
+  `;
+
+  if (!courses || courses.length === 0) {
+    throw new Error('Course not found.');
+  }
+
+  // 3. Mark the registration as DROPPED
+  await tx.registration.update({
+    where: { id: existingReg.id },
+    data: { status: 'DROPPED' }
+  });
+
+  await tx.auditLog.create({
+    data: { userId: existingReg.userId, action: auditAction, courseId }
+  });
+
+  // 4. Decrement filledSeats
+  await tx.course.update({
+    where: { id: courseId },
+    data: { filledSeats: { decrement: 1 } }
+  });
+
+  // 5. Find the first waitlisted student (locked with FOR UPDATE)
+  const waitlistedRows: any[] = await tx.$queryRaw`
+    SELECT * FROM "Waitlist"
+    WHERE "courseId" = ${courseId}
+    ORDER BY position ASC
+    LIMIT 1
+    FOR UPDATE
+  `;
+
+  let promotedStudent = null;
+
+  if (waitlistedRows && waitlistedRows.length > 0) {
+    const nextStudent = waitlistedRows[0];
+
+    const existingWaitlistedReg = await tx.registration.findUnique({
+      where: { userId_courseId: { userId: nextStudent.userId, courseId } }
+    });
+
+    if (existingWaitlistedReg) {
+      promotedStudent = await tx.registration.update({
+        where: { id: existingWaitlistedReg.id },
+        data: { status: 'ENROLLED' }
+      });
+    } else {
+      promotedStudent = await tx.registration.create({
+        data: { userId: nextStudent.userId, courseId, status: 'ENROLLED' }
+      });
+    }
+
+    // Re-increment filledSeats (net zero: one dropped, one promoted)
+    await tx.course.update({
+      where: { id: courseId },
+      data: { filledSeats: { increment: 1 } }
+    });
+
+    // Remove the waitlist entry
+    await tx.waitlist.delete({ where: { id: nextStudent.id } });
+
+    await tx.auditLog.create({
+      data: {
+        userId: nextStudent.userId,
+        action: 'PROMOTE',
+        courseId,
+        details: { promotedFromWaitlist: true }
+      }
+    });
+  }
+
+  return { dropped: true, droppedRegistrationId: existingReg.id, promotedStudent };
 };

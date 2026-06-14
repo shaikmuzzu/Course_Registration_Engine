@@ -22,12 +22,14 @@ enum AuditAction {
   WAITLIST
   DROP
   PROMOTE
+  ADMIN_DROP
 }
 
 model User {
   id            String         @id @default(uuid())
   email         String         @unique
   name          String
+  password      String
   role          Role           @default(STUDENT)
   totalCredits  Int            @default(0)
   registrations Registration[]
@@ -114,4 +116,9 @@ model AuditLog {
 
   @@index([userId])
   @@index([courseId])
+}
+
+model SystemSettings {
+  id                  String @id @default("default")
+  maxSemesterCredits  Int    @default(18)
 }

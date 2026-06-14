@@ -1,4 +1,6 @@
 import express, { Request, Response } from 'express';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import 'dotenv/config';
 import { prisma, pool } from './lib/prisma';
 import {
@@ -6,8 +8,12 @@ import {
   checkPrerequisites,
   checkTimeClash,
   checkAlreadyEnrolled,
-  checkAlreadyWaitlisted
+  checkAlreadyWaitlisted,
+  executeDropWithPromotion
 } from './services/validation.service';
+import { authenticate } from './middlewares/auth.middleware';
+import authRouter from './routes/auth.routes';
+import adminRouter from './routes/admin.routes';
 
 // Custom error class for client-facing errors with explicit status codes
 class AppError extends Error {
@@ -21,20 +27,105 @@ class AppError extends Error {
 
 // Initialize Express App
 const app = express();
+
+// ---------------------------------------------------------------------------
+// CORS  –  Allow requests from the Next.js frontend
+// ---------------------------------------------------------------------------
+app.use(cors({
+  origin: 'http://localhost:4000',
+  credentials: true
+}));
+
 app.use(express.json());
+
+// ---------------------------------------------------------------------------
+// Rate Limiters
+// ---------------------------------------------------------------------------
+const standardLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests. Please try again later.' }
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many auth attempts. Please try again later.' }
+});
+
+// Apply standard rate limiter to all API routes
+app.use('/api', standardLimiter);
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+// Auth routes (login/register) with stricter rate limiting
+app.use('/api/auth', authLimiter, authRouter);
+
+// Admin routes (protected internally with authenticate + authorizeRole)
+app.use('/api/admin', adminRouter);
 
 app.get('/api/health', (req: Request, res: Response) => {
   res.status(200).json({ status: 'success', message: 'Engine is LIVE.' });
 });
 
 // ---------------------------------------------------------------------------
-// POST /api/register  –  Master Registration Endpoint
+// GET /api/courses  –  List all available courses (JWT-protected)
 // ---------------------------------------------------------------------------
-app.post('/api/register', async (req: Request, res: Response): Promise<any> => {
-  const { userId, courseId } = req.body;
+app.get('/api/courses', authenticate, async (_req: Request, res: Response): Promise<any> => {
+  try {
+    const courses = await prisma.course.findMany({
+      include: {
+        prerequisites: { select: { prerequisiteId: true } }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    return res.status(200).json({ success: true, data: courses });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'An unexpected error occurred.';
+    return res.status(500).json({ success: false, message });
+  }
+});
 
-  if (!userId || !courseId) {
-    return res.status(400).json({ success: false, message: 'Missing userId or courseId' });
+// ---------------------------------------------------------------------------
+// GET /api/enrolled  –  Get the authenticated user's enrolled courses
+// ---------------------------------------------------------------------------
+app.get('/api/enrolled', authenticate, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = req.user!.userId;
+    const registrations = await prisma.registration.findMany({
+      where: { userId, status: 'ENROLLED' },
+      include: { course: true },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const totalCredits = registrations.reduce((sum: number, r: { course: { credits: number } }) => sum + r.course.credits, 0);
+
+    return res.status(200).json({
+      success: true,
+      data: registrations.map((r: { course: unknown }) => r.course),
+      totalCredits
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'An unexpected error occurred.';
+    return res.status(500).json({ success: false, message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/register  –  Master Registration Endpoint (JWT-protected)
+// ---------------------------------------------------------------------------
+app.post('/api/register', authenticate, async (req: Request, res: Response): Promise<any> => {
+  const userId = req.user!.userId;
+  const { courseId } = req.body;
+
+  if (!courseId) {
+    return res.status(400).json({ success: false, message: 'Missing courseId' });
   }
 
   try {
@@ -174,107 +265,19 @@ app.post('/api/register', async (req: Request, res: Response): Promise<any> => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /api/drop  –  Drop a Course + Event-Driven Waitlist Promotion
+// POST /api/drop  –  Drop a Course + Event-Driven Waitlist Promotion (JWT-protected)
 // ---------------------------------------------------------------------------
-app.post('/api/drop', async (req: Request, res: Response): Promise<any> => {
-  const { userId, courseId } = req.body;
+app.post('/api/drop', authenticate, async (req: Request, res: Response): Promise<any> => {
+  const userId = req.user!.userId;
+  const { courseId } = req.body;
 
-  if (!userId || !courseId) {
-    return res.status(400).json({ success: false, message: 'Missing userId or courseId' });
+  if (!courseId) {
+    return res.status(400).json({ success: false, message: 'Missing courseId' });
   }
 
   try {
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Verify the student is currently ENROLLED
-      const existingReg = await tx.registration.findUnique({
-        where: { userId_courseId: { userId, courseId } }
-      });
-
-      if (!existingReg || existingReg.status !== 'ENROLLED') {
-        throw new AppError('Student is not currently enrolled in this course.');
-      }
-
-      // 2. Lock the course row with FOR UPDATE
-      const courses: any[] = await tx.$queryRaw`
-        SELECT * FROM "Course" WHERE id = ${courseId} FOR UPDATE
-      `;
-
-      if (!courses || courses.length === 0) {
-        throw new AppError('Course not found.', 404);
-      }
-
-      // 3. Mark the registration as DROPPED
-      await tx.registration.update({
-        where: { id: existingReg.id },
-        data: { status: 'DROPPED' }
-      });
-
-      await tx.auditLog.create({
-        data: {
-          userId: existingReg.userId,
-          action: 'DROP',
-          courseId
-        }
-      });
-
-      // 4. Decrement filledSeats
-      await tx.course.update({
-        where: { id: courseId },
-        data: { filledSeats: { decrement: 1 } }
-      });
-
-      // 5. Find the first waitlisted student (locked with FOR UPDATE)
-      const waitlistedRows: any[] = await tx.$queryRaw`
-        SELECT * FROM "Waitlist"
-        WHERE "courseId" = ${courseId}
-        ORDER BY position ASC
-        LIMIT 1
-        FOR UPDATE
-      `;
-
-      let promotedStudent = null;
-
-      if (waitlistedRows && waitlistedRows.length > 0) {
-        const nextStudent = waitlistedRows[0];
-
-        // The promoted student may already have a WAITLISTED registration row
-        const existingWaitlistedReg = await tx.registration.findUnique({
-          where: { userId_courseId: { userId: nextStudent.userId, courseId } }
-        });
-
-        if (existingWaitlistedReg) {
-          // Flip the existing WAITLISTED row to ENROLLED
-          promotedStudent = await tx.registration.update({
-            where: { id: existingWaitlistedReg.id },
-            data: { status: 'ENROLLED' }
-          });
-        } else {
-          // Create a fresh ENROLLED registration
-          promotedStudent = await tx.registration.create({
-            data: { userId: nextStudent.userId, courseId, status: 'ENROLLED' }
-          });
-        }
-
-        // Re-increment filledSeats (net zero: one dropped, one promoted)
-        await tx.course.update({
-          where: { id: courseId },
-          data: { filledSeats: { increment: 1 } }
-        });
-
-        // Remove the waitlist entry
-        await tx.waitlist.delete({ where: { id: nextStudent.id } });
-
-        await tx.auditLog.create({
-          data: {
-            userId: nextStudent.userId,
-            action: 'PROMOTE',
-            courseId,
-            details: { promotedFromWaitlist: true }
-          }
-        });
-      }
-
-      return { dropped: true, droppedRegistrationId: existingReg.id, promotedStudent };
+      return executeDropWithPromotion(tx, userId, courseId, 'DROP');
     });
 
     const responseBody: Record<string, unknown> = {
