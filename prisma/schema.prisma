@@ -17,6 +17,13 @@ enum RegistrationStatus {
   WAITLISTED
 }
 
+enum AuditAction {
+  REGISTER
+  WAITLIST
+  DROP
+  PROMOTE
+}
+
 model User {
   id            String         @id @default(uuid())
   email         String         @unique
@@ -25,28 +32,32 @@ model User {
   totalCredits  Int            @default(0)
   registrations Registration[]
   waitlists     Waitlist[]
+  auditLogs     AuditLog[]
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
 }
 
 model Course {
-  id            String         @id @default(uuid())
-  title         String
-  capacity      Int
-  filledSeats   Int            @default(0)
-  credits       Int
-  startTime     DateTime       
-  endTime       DateTime
-  daysOfWeek    Int[]          
+  id                String         @id @default(uuid())
+  title             String
+  capacity          Int
+  filledSeats       Int            @default(0)
+  credits           Int
+  startTime         DateTime       
+  endTime           DateTime
+  daysOfWeek        Int[]          
+  registrationStart DateTime?
+  registrationEnd   DateTime?
   
-  registrations Registration[]
-  waitlists     Waitlist[]
+  registrations     Registration[]
+  waitlists         Waitlist[]
+  auditLogs         AuditLog[]
   
-  prerequisites Prerequisite[] @relation("CourseToPrerequisite")
-  requiredFor   Prerequisite[] @relation("PrerequisiteToCourse")
+  prerequisites     Prerequisite[] @relation("CourseToPrerequisite")
+  requiredFor       Prerequisite[] @relation("PrerequisiteToCourse")
 
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
 }
 
 model Registration {
@@ -88,4 +99,19 @@ model Prerequisite {
   prerequisite   Course @relation("PrerequisiteToCourse", fields: [prerequisiteId], references: [id])
 
   @@id([courseId, prerequisiteId])
+}
+
+model AuditLog {
+  id        String      @id @default(uuid())
+  userId    String
+  action    AuditAction
+  courseId  String
+  details   Json?
+  createdAt DateTime    @default(now())
+
+  user      User        @relation(fields: [userId], references: [id])
+  course    Course      @relation(fields: [courseId], references: [id])
+
+  @@index([userId])
+  @@index([courseId])
 }

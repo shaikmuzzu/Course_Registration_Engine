@@ -38,6 +38,30 @@ app.post('/api/register', async (req: Request, res: Response): Promise<any> => {
   }
 
   try {
+    // --- STEP A0: Registration Window Guard (Temporal Check) ---
+    const courseForWindow = await prisma.course.findUnique({
+      where: { id: courseId },
+      select: { registrationStart: true, registrationEnd: true }
+    });
+
+    if (!courseForWindow) {
+      return res.status(404).json({ success: false, message: 'Course not found.' });
+    }
+
+    const now = new Date();
+    if (courseForWindow.registrationStart && now < courseForWindow.registrationStart) {
+      return res.status(400).json({
+        success: false,
+        message: 'Registration window has not opened yet for this course.'
+      });
+    }
+    if (courseForWindow.registrationEnd && now > courseForWindow.registrationEnd) {
+      return res.status(400).json({
+        success: false,
+        message: 'Registration window is closed for this course.'
+      });
+    }
+
     // --- STEP A: Duplicate Registration Guard ---
     const enrolledCheck = await checkAlreadyEnrolled(userId, courseId);
     if (!enrolledCheck.success) return res.status(400).json(enrolledCheck);
@@ -88,6 +112,15 @@ app.post('/api/register', async (req: Request, res: Response): Promise<any> => {
           data: { userId, courseId, status: 'WAITLISTED' }
         });
 
+        await tx.auditLog.create({
+          data: {
+            userId,
+            action: 'WAITLIST',
+            courseId,
+            details: { position: nextPosition }
+          }
+        });
+
         return { waitlisted: true as const, position: nextPosition, waitlistEntry, registration };
       }
 
@@ -99,6 +132,14 @@ app.post('/api/register', async (req: Request, res: Response): Promise<any> => {
       await tx.course.update({
         where: { id: courseId },
         data: { filledSeats: { increment: 1 } }
+      });
+
+      await tx.auditLog.create({
+        data: {
+          userId,
+          action: 'REGISTER',
+          courseId
+        }
       });
 
       return { waitlisted: false as const, registration };
@@ -168,6 +209,14 @@ app.post('/api/drop', async (req: Request, res: Response): Promise<any> => {
         data: { status: 'DROPPED' }
       });
 
+      await tx.auditLog.create({
+        data: {
+          userId: existingReg.userId,
+          action: 'DROP',
+          courseId
+        }
+      });
+
       // 4. Decrement filledSeats
       await tx.course.update({
         where: { id: courseId },
@@ -214,6 +263,15 @@ app.post('/api/drop', async (req: Request, res: Response): Promise<any> => {
 
         // Remove the waitlist entry
         await tx.waitlist.delete({ where: { id: nextStudent.id } });
+
+        await tx.auditLog.create({
+          data: {
+            userId: nextStudent.userId,
+            action: 'PROMOTE',
+            courseId,
+            details: { promotedFromWaitlist: true }
+          }
+        });
       }
 
       return { dropped: true, droppedRegistrationId: existingReg.id, promotedStudent };
