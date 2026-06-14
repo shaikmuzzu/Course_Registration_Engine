@@ -1,13 +1,91 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
-  provider = "prisma-client"
-  output   = "../generated/prisma"
+  provider = "prisma-client-js"
 }
 
 datasource db {
   provider = "postgresql"
+}
+
+enum Role {
+  STUDENT
+  ADMIN
+}
+
+enum RegistrationStatus {
+  ENROLLED
+  DROPPED
+  WAITLISTED
+}
+
+model User {
+  id            String         @id @default(uuid())
+  email         String         @unique
+  name          String
+  role          Role           @default(STUDENT)
+  totalCredits  Int            @default(0)
+  registrations Registration[]
+  waitlists     Waitlist[]
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+}
+
+model Course {
+  id            String         @id @default(uuid())
+  title         String
+  capacity      Int
+  filledSeats   Int            @default(0)
+  credits       Int
+  startTime     DateTime       
+  endTime       DateTime
+  daysOfWeek    Int[]          
+  
+  registrations Registration[]
+  waitlists     Waitlist[]
+  
+  prerequisites Prerequisite[] @relation("CourseToPrerequisite")
+  requiredFor   Prerequisite[] @relation("PrerequisiteToCourse")
+
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+}
+
+model Registration {
+  id        String             @id @default(uuid())
+  userId    String
+  courseId  String
+  status    RegistrationStatus @default(ENROLLED)
+  
+  user      User               @relation(fields: [userId], references: [id])
+  course    Course             @relation(fields: [courseId], references: [id])
+  
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+
+  @@unique([userId, courseId]) 
+  @@index([courseId])          
+}
+
+model Waitlist {
+  id        String   @id @default(uuid())
+  userId    String
+  courseId  String
+  position  Int
+  
+  user      User     @relation(fields: [userId], references: [id])
+  course    Course   @relation(fields: [courseId], references: [id])
+  
+  createdAt DateTime @default(now())
+
+  @@unique([userId, courseId])   
+  @@unique([courseId, position]) 
+}
+
+model Prerequisite {
+  courseId       String
+  prerequisiteId String
+  
+  course         Course @relation("CourseToPrerequisite", fields: [courseId], references: [id])
+  prerequisite   Course @relation("PrerequisiteToCourse", fields: [prerequisiteId], references: [id])
+
+  @@id([courseId, prerequisiteId])
 }
